@@ -5,3 +5,4 @@ colorama
 img2pdf
 KindleComicConverter
 Wand
+rich==13.7.0
