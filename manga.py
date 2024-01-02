@@ -20,7 +20,14 @@ import tempfile
 import bisect
 import platform
 import subprocess
+import asyncio
 from multiprocessing import freeze_support
+from rich.progress import (
+  BarColumn,
+  MofNCompleteColumn,
+  Progress,
+  TextColumn,
+)
 
 def install_dependencies(dependencies_file):
   # Check dependencies
@@ -59,6 +66,7 @@ DIRECTORY_KEEP = FILENAME_KEEP | set(['/'])
 EXTENSION_KEEP = set('.')
 
 SCRAPER = cloudscraper.create_scraper()
+MAX_BATCH_SIZE = 5
 
 CHAPTERS_FORMAT = 'Format: start..end or chapters with commas. Example: --chapter 3 will download chapter 3, --chapter last will download the last chapter available, --chapters 3..last will download chapters from 3 to the last chapter, --chapter 3 will download only chapter 3, --chapters "3, 12" will download chapters 3 and 12, --chapters "3..12, 15" will download chapters from 3 to 12 and also chapter 15.'
 
@@ -77,6 +85,16 @@ def set_args():
   parser.add_argument("--remove-alpha", action='store_true', help="When converting to PDF remove alpha channel on images using ImageMagick Wand")
   parser.add_argument("--version", "-v", action=CheckVersion, help="Display current InMangaKindle version", version=VERSION)
   args = parser.parse_args()
+
+class Scraper():
+  @classmethod
+  async def _get(cls, url):
+    response = await asyncio.to_thread(SCRAPER.get, url)
+    return response
+
+  @classmethod
+  async def get(cls, url):
+    return await cls._get(url)
 
 class CheckVersion(argparse.Action):
   def __init__(self, option_strings, version=VERSION, **kwargs):
@@ -169,18 +187,11 @@ def network_error():
     tip += '\nYou can use offline mode (using your already downloaded chapters) with --cache'
   error('Network error', tip)
 
-def success(request, text='', ok=200, print_ok=True):
-  if request.status_code == ok:
-    if print_ok:
-      print_colored(text if text else request.url, Fore.GREEN)
-    return True
-  else:
-    text = f'{text}\n' if text else ''
-    print_colored(f'{text}[{request.status_code}] {request.url}', Fore.RED)
-    return False
+def success(request, ok=200):
+  return request.status_code == ok
 
 def exit_if_fails(request):
-  if not success(request, print_ok=False):
+  if not success(request):
     exit(1)
 
 def write_file(path, data):
@@ -205,15 +216,67 @@ def decode(title):
 def plural(size):
   return 's' if size != 1 else ''
 
-def download(filename, url, directory='.', extension='png', text='', ok=200):
+def init_progress_table():
+  return Progress(
+    TextColumn("{task.description}"),
+    BarColumn(),
+    MofNCompleteColumn(),
+  )
+
+async def download_and_store_chapters(chapters, chapters_ids):
+  """Download and save the manga chapters
+
+  Args:
+      chapters (List[int]): chapters to download
+      chapters_names (List[str]): chapters names to download
+  """
+  chapters_batches = [
+    chapters[i:i+MAX_BATCH_SIZE] for i in range(0, len(chapters), MAX_BATCH_SIZE)]
+
+  for chapters_batch in chapters_batches:
+    with init_progress_table() as progress:
+      pages_futures = []
+      for chapter in chapters_batch:
+        url = CHAPTER_PAGES_WEBSITE + chapters_ids[chapter]
+        pages_futures.append(fetch_page(url, f'{manga_title} {chapter:g}', progress))
+
+      futures = []
+      pages = await asyncio.gather(*pages_futures)
+      for i, (page, progress_id) in enumerate(pages):
+        chapter_dir = chapter_directory(manga, chapters_batch[i])
+        if success(page):
+          futures.append(download_chapter(page, chapter_dir, progress, progress_id))
+
+      await asyncio.gather(*futures)
+  
+async def fetch_page(url, chapter_title, progress: 'Progress'):
+  try:
+    page = await Scraper.get(url)
+  except requests.exceptions.ConnectionError:
+    network_error()
+    raise
+
+  html = BeautifulSoup(page.content, 'html.parser')
+  pages = html.find(id='PageList').find_all(True, recursive=False)
+  progress_id = progress.add_task(chapter_title, total=len(pages))
+  return page, progress_id
+      
+async def download_chapter(page, chapter_dir, progress: 'Progress', chap_title: str):
+  html = BeautifulSoup(page.content, 'html.parser')
+  pages = html.find(id='PageList').find_all(True, recursive=False)
+  for page in pages:
+    page_id = page.get('value')
+    page_number = int(page.get_text())
+    img_url = IMAGE_WEBSITE + page_id
+    progress.update(chap_title, advance=1)
+    await download(page_number, img_url, chapter_dir)
+
+async def download(filename, url, directory='.', extension='png', ok=200):
   path = encode_path(filename, extension, directory)
   if os.path.isfile(path):
-    text = text if text else path
-    separation = ' ' * (20 - len(text))
-    print_colored(f'{text}{separation}- Already exists', Fore.YELLOW)
     return False
-  req = SCRAPER.get(url)
-  if success(req, text, ok, print_ok=bool(text)):
+  req = await Scraper.get(url)
+  if success(req, ok):
     data = req.content
     write_file(path, data)
     return True
@@ -597,26 +660,7 @@ if __name__ == "__main__":
 
   if not args.cache:
     # DOWNLOAD CHAPTERS
-
-    for chapter in CHAPTERS:
-      print_colored(f'Downloading {manga_title} {chapter:g}', Fore.YELLOW, Style.BRIGHT)
-
-      url = CHAPTER_PAGES_WEBSITE + CHAPTERS_IDS[chapter]
-
-      chapter_dir = chapter_directory(manga, chapter)
-      try:
-        page = SCRAPER.get(url)
-
-        if success(page, print_ok=False):
-          html = BeautifulSoup(page.content, 'html.parser')
-          pages = html.find(id='PageList').find_all(True, recursive=False)
-          for page in pages:
-            page_id = page.get('value')
-            page_number = int(page.get_text())
-            url = IMAGE_WEBSITE + page_id
-            download(page_number, url, chapter_dir, text=f'Page {page_number}/{len(pages)} ({100*page_number//len(pages)}%)')
-      except requests.exceptions.ConnectionError:
-        network_error()
+    asyncio.run(download_and_store_chapters(CHAPTERS, CHAPTERS_IDS))
 
   extension = f'.{args.format.lower()}'
   args.format = args.format.upper()
